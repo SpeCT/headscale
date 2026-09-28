@@ -40,6 +40,7 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0
 	github.com/hashicorp/golang-lru/v2 v2.0.8-0.20261012062354-235099c106fc
 	github.com/jagottsicher/termcolor v1.0.2
+	github.com/miekg/dns v1.1.73
 	github.com/oauth2-proxy/mockoidc v0.0.0-20240214162133-caebfff84d25
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/philip-bui/grpc-zerolog v1.0.1

@@ -38,4 +38,9 @@ var (
 		Name:      "mapresponse_ended_total",
 		Help:      "total count of new mapsessions ended",
 	}, []string{"reason"})
+	acmeSetDNSRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: prometheusNamespace,
+		Name:      "acme_set_dns_requests_total",
+		Help:      "total count of /machine/set-dns requests (ACME DNS-01 challenges) by outcome",
+	}, []string{"status"})
 )

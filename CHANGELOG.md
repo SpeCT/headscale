@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## Unreleased
+
+### Tailscale Serve over HTTPS
+
+Headscale can now provision per-node HTTPS/TLS certificates, enabling
+`tailscale serve` (HTTPS) and `tailscale cert`. When `dns.https_certs` is
+enabled, Headscale advertises each node's FQDN in `DNSConfig.CertDomains`,
+grants nodes the `https` capability the serve CLI checks for, implements
+`/machine/set-dns`, and runs an embedded authoritative DNS server for
+`dns.base_domain` that answers the ACME DNS-01 `_acme-challenge` TXT lookups
+nodes use to obtain Let's Encrypt certificates. The node performs the ACME
+exchange itself, so Headscale never sees the certificate or any private key.
+Only challenge TXT records and the zone SOA/NS are served publicly; node
+A/AAAA records stay private to MagicDNS.
+
+This requires MagicDNS and a real, publicly delegated `base_domain`. Tailscale
+Funnel remains unsupported because it depends on Tailscale's public ingress
+infrastructure. See the [Serve documentation](./docs/ref/serve.md) for setup.
+
+[#1921](https://github.com/juanfont/headscale/issues/1921)
+[#2527](https://github.com/juanfont/headscale/issues/2527)
+[#3300](https://github.com/juanfont/headscale/pull/3300)
+
 ## 0.29.7 (2026-10-30)
 
 **Minimum supported Tailscale client version: v1.80.0**
