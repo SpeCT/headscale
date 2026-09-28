@@ -161,6 +161,21 @@ func generateDNSConfig(
 		}
 	}
 
+	// Advertise the node's own FQDN as the domain headscale will help it
+	// obtain a TLS certificate for (`tailscale cert`, `tailscale serve`).
+	// The client treats certificates as unavailable unless CertDomains is
+	// set. Entries are FQDNs without a trailing dot.
+	if cfg.DNSConfig.HTTPSCerts.Enabled {
+		fqdn, err := node.GetFQDN(cfg.BaseDomain)
+		if err != nil {
+			log.Warn().Caller().Err(err).
+				Uint64("node.id", node.ID().Uint64()).
+				Msg("not advertising CertDomains for node without a valid FQDN")
+		} else {
+			dnsConfig.CertDomains = []string{strings.TrimSuffix(fqdn, ".")}
+		}
+	}
+
 	return dnsConfig
 }
 

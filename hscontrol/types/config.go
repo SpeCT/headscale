@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -32,16 +33,20 @@ const (
 )
 
 var (
-	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
-	errOIDCIssuerInvalid         = errors.New("oidc.issuer must be a valid http(s) URL")
-	errOIDCClientIDRequired      = errors.New("oidc.client_id is required when oidc.issuer is set")
-	errOIDCClientSecretRequired  = errors.New("oidc.client_secret or oidc.client_secret_path is required when oidc.issuer is set")
-	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
-	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
-	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
-	errTrustedProxyZeroRange     = errors.New("0.0.0.0/0 and ::/0 are not allowed")
-	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
-	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
+	errOidcMutuallyExclusive        = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
+	errOIDCIssuerInvalid            = errors.New("oidc.issuer must be a valid http(s) URL")
+	errOIDCClientIDRequired         = errors.New("oidc.client_id is required when oidc.issuer is set")
+	errOIDCClientSecretRequired     = errors.New("oidc.client_secret or oidc.client_secret_path is required when oidc.issuer is set")
+	errServerURLSuffix              = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
+	errServerURLSame                = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
+	errInvalidPKCEMethod            = errors.New("pkce.method must be either 'plain' or 'S256'")
+	errTrustedProxyZeroRange        = errors.New("0.0.0.0/0 and ::/0 are not allowed")
+	errHTTPSCertsRequiresMagicDNS   = errors.New("dns.https_certs.enabled requires dns.magic_dns to be enabled")
+	errHTTPSCertsRequiresBaseDomain = errors.New("dns.https_certs.enabled requires dns.base_domain to be set")
+	errHTTPSCertsInvalidListenAddr  = errors.New("dns.https_certs.listen_addr must be a host:port address")
+	errHTTPSCertsNoNameserver       = errors.New("dns.https_certs.nameserver must be set when server_url has no hostname")
+	ErrNoPrefixConfigured           = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
+	ErrInvalidAllocationStrategy    = errors.New("invalid prefix allocation strategy")
 )
 
 type IPAllocationStrategy string
@@ -155,6 +160,33 @@ type DNSConfig struct {
 	SearchDomains    []string            `mapstructure:"search_domains"`
 	ExtraRecords     []tailcfg.DNSRecord `mapstructure:"extra_records"`
 	ExtraRecordsPath string              `mapstructure:"extra_records_path"`
+
+	// HTTPSCerts enables per-node HTTPS certificates for `tailscale serve`
+	// and `tailscale cert` via ACME DNS-01 challenges.
+	HTTPSCerts HTTPSCertsConfig `mapstructure:"https_certs"`
+}
+
+// HTTPSCertsConfig configures per-node HTTPS certificate provisioning via
+// ACME DNS-01. When enabled, headscale advertises each node's FQDN in
+// [tailcfg.DNSConfig.CertDomains], grants [tailcfg.CapabilityHTTPS] and runs
+// an embedded authoritative DNS server for base_domain that answers the
+// `_acme-challenge` TXT lookups. base_domain must be a real, publicly
+// delegated zone whose NS record points at Nameserver.
+type HTTPSCertsConfig struct {
+	// Enabled turns on per-node HTTPS certificate provisioning.
+	Enabled bool `mapstructure:"enabled"`
+
+	// ListenAddr is the UDP/TCP address the embedded authoritative DNS
+	// server listens on for ACME DNS-01 challenge queries from public
+	// resolvers (default ":53"). Binding a low port may require
+	// CAP_NET_BIND_SERVICE.
+	ListenAddr string `mapstructure:"listen_addr"`
+
+	// Nameserver is the public hostname of this authoritative DNS server,
+	// reported in SOA and NS answers. It defaults to the hostname of
+	// server_url. Prefer a name outside base_domain, otherwise the parent
+	// zone must also carry glue A/AAAA records for it.
+	Nameserver string `mapstructure:"nameserver"`
 }
 
 type Nameservers struct {
@@ -440,6 +472,10 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("dns.nameservers.global", []string{})
 	viper.SetDefault("dns.nameservers.split", map[string]string{})
 	viper.SetDefault("dns.search_domains", []string{})
+	viper.SetDefault("dns.https_certs.enabled", false)
+	// listen_addr and nameserver have no viper defaults; an empty value is
+	// resolved by DNSConfig.resolveHTTPSCerts so the parsed config stays
+	// empty when the feature is off.
 
 	viper.SetDefault("derp.server.enabled", false)
 	viper.SetDefault("derp.server.verify_clients", true)
@@ -911,6 +947,9 @@ func dns() (DNSConfig, error) {
 	dns.Nameservers.Split = viper.GetStringMapStringSlice("dns.nameservers.split")
 	dns.SearchDomains = viper.GetStringSlice("dns.search_domains")
 	dns.ExtraRecordsPath = viper.GetString("dns.extra_records_path")
+	dns.HTTPSCerts.Enabled = viper.GetBool("dns.https_certs.enabled")
+	dns.HTTPSCerts.ListenAddr = viper.GetString("dns.https_certs.listen_addr")
+	dns.HTTPSCerts.Nameserver = viper.GetString("dns.https_certs.nameserver")
 
 	if viper.IsSet("dns.extra_records") {
 		var extraRecords []tailcfg.DNSRecord
@@ -924,6 +963,59 @@ func dns() (DNSConfig, error) {
 	}
 
 	return dns, nil
+}
+
+// resolveHTTPSCerts validates dns.https_certs and fills in its defaults.
+// Per-node certificates advertise CertDomains derived from base_domain and
+// answer ACME DNS-01 challenges for that zone, so MagicDNS and a base domain
+// are required. The nameserver defaults to the hostname of server_url.
+func (d *DNSConfig) resolveHTTPSCerts(serverURL string) error {
+	c := &d.HTTPSCerts
+	if !c.Enabled {
+		return nil
+	}
+
+	if !d.MagicDNS {
+		return errHTTPSCertsRequiresMagicDNS
+	}
+
+	if d.BaseDomain == "" {
+		return errHTTPSCertsRequiresBaseDomain
+	}
+
+	if c.ListenAddr == "" {
+		c.ListenAddr = ":53"
+	}
+
+	_, _, err := net.SplitHostPort(c.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errHTTPSCertsInvalidListenAddr, err)
+	}
+
+	if c.Nameserver == "" {
+		u, err := url.Parse(serverURL)
+		if err != nil || u.Hostname() == "" {
+			return errHTTPSCertsNoNameserver
+		}
+
+		if _, err := netip.ParseAddr(u.Hostname()); err == nil { //nolint:noinlineerr
+			return errHTTPSCertsNoNameserver
+		}
+
+		c.Nameserver = u.Hostname()
+	}
+
+	c.Nameserver = strings.TrimSuffix(strings.ToLower(c.Nameserver), ".")
+	baseDomain := strings.TrimSuffix(strings.ToLower(d.BaseDomain), ".")
+
+	if c.Nameserver == baseDomain || strings.HasSuffix(c.Nameserver, "."+baseDomain) {
+		log.Warn().
+			Str("nameserver", c.Nameserver).
+			Str("base_domain", baseDomain).
+			Msg("dns.https_certs.nameserver is inside base_domain; the parent zone must publish glue A/AAAA records for it, a name outside base_domain avoids this")
+	}
+
+	return nil
 }
 
 // globalResolvers returns the global DNS resolvers
@@ -1240,6 +1332,11 @@ func LoadServerConfig() (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	err = dnsConfig.resolveHTTPSCerts(serverURL)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Config{

@@ -1331,6 +1331,15 @@ func (nv NodeView) TailNode(
 		capMap[tailcfg.CapabilityFileSharing] = []tailcfg.RawMessage{}
 	}
 
+	// dns.https_certs gates CapabilityHTTPS. The `tailscale serve` CLI
+	// refuses to configure an HTTPS listener unless the self node carries
+	// it (otherwise it asks control to enable the feature through
+	// /machine/feature/query, which headscale does not implement).
+	// CertDomains in the DNS config carries the actual certificate name.
+	if cfg.DNSConfig.HTTPSCerts.Enabled {
+		capMap[tailcfg.CapabilityHTTPS] = []tailcfg.RawMessage{}
+	}
+
 	// default-auto-update is always emitted; the value is a JSON bool
 	// reflecting cfg.AutoUpdate.Enabled. Clients read this on first
 	// netmap and store the default locally; subsequent control-plane

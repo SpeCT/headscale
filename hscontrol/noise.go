@@ -9,12 +9,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/metrics"
 	"github.com/juanfont/headscale/hscontrol/capver"
+	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -182,10 +184,10 @@ func (h *Headscale) NoiseUpgradeHandler(
 		// https://github.com/tailscale/tailscale/blob/dfba01ca9bd8c4df02c3c32f400d9aeb897c5fc7/cmd/tailscale/cli/debug.go#L1138
 		r.Get("/whoami", ns.NotImplementedHandler)
 
-		// client sends a [tailcfg.SetDNSRequest] to this endpoints and expect
-		// the server to create or update this DNS record "somewhere".
-		// It is typically a TXT record for an ACME challenge.
-		r.Post("/set-dns", ns.NotImplementedHandler)
+		// client sends a [tailcfg.SetDNSRequest] to this endpoint and expects
+		// the server to publish the DNS record. It is the TXT record of an
+		// ACME DNS-01 challenge (`tailscale cert`, `tailscale serve`).
+		r.Post("/set-dns", ns.SetDNSHandler)
 
 		// A patch of [tailcfg.SetDeviceAttributesRequest] to update device attributes.
 		// We currently do not support device attributes.
@@ -722,7 +724,7 @@ func (ns *noiseServer) PollNetMapHandler(
 		return
 	}
 
-	nv, err := ns.getAndValidateNode(mapRequest)
+	nv, err := ns.getAndValidateNode(mapRequest.NodeKey)
 	if err != nil {
 		// The node is gone, but the client does not know that. Tailscale
 		// clients treat every non-200 on the map path the same way and retry
@@ -834,8 +836,8 @@ var errNodeNotInStore = errors.New("node not found")
 
 // getAndValidateNode retrieves the node from the in-memory NodeStore using the
 // NodeKey and validates that it matches the MachineKey from the Noise session.
-func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.NodeView, error) {
-	nv, ok := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)
+func (ns *noiseServer) getAndValidateNode(nodeKey key.NodePublic) (types.NodeView, error) {
+	nv, ok := ns.headscale.state.GetNodeByNodeKey(nodeKey)
 	if !ok {
 		return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node not found", errNodeNotInStore)
 	}
@@ -846,4 +848,120 @@ func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.
 	}
 
 	return nv, nil
+}
+
+// setDNSBodyLimit bounds a [tailcfg.SetDNSRequest] body. It carries a node
+// key, a name and a short TXT value, so a few KiB leaves ample headroom.
+const setDNSBodyLimit int64 = 4096
+
+// SetDNSHandler handles a [tailcfg.SetDNSRequest] from a node. Tailscale
+// clients call this to publish the TXT record that answers an ACME DNS-01
+// challenge when requesting an HTTPS certificate for their MagicDNS name
+// (`tailscale cert`, `tailscale serve`).
+//
+// A node may only publish the challenge record for its own current FQDN.
+// The record is served by the embedded authoritative DNS server until it
+// expires; headscale never sees the certificate or any private key.
+func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		httpError(writer, errMethodNotAllowed)
+
+		return
+	}
+
+	if ns.headscale.acmeDNS == nil {
+		acmeSetDNSRequests.WithLabelValues("disabled").Inc()
+		httpError(writer, NewHTTPError(
+			http.StatusNotImplemented,
+			"per-node HTTPS certificates are not enabled (dns.https_certs)",
+			nil,
+		))
+
+		return
+	}
+
+	var dnsReq tailcfg.SetDNSRequest
+
+	err := json.NewDecoder(http.MaxBytesReader(writer, req.Body, setDNSBodyLimit)).Decode(&dnsReq)
+	if err != nil {
+		acmeSetDNSRequests.WithLabelValues("rejected").Inc()
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "invalid SetDNSRequest body", err))
+
+		return
+	}
+
+	nv, err := ns.getAndValidateNode(dnsReq.NodeKey)
+	if err != nil {
+		acmeSetDNSRequests.WithLabelValues("rejected").Inc()
+		httpError(writer, err)
+
+		return
+	}
+
+	if nv.IsExpired() {
+		acmeSetDNSRequests.WithLabelValues("rejected").Inc()
+		httpError(writer, NewHTTPError(http.StatusForbidden, "node key has expired", nil))
+
+		return
+	}
+
+	if !strings.EqualFold(dnsReq.Type, "TXT") {
+		acmeSetDNSRequests.WithLabelValues("rejected").Inc()
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "only TXT records are supported", nil))
+
+		return
+	}
+
+	// The only record a node may publish is the ACME challenge for its own
+	// FQDN; sibling nodes, wildcards, the apex and anything else is refused.
+	fqdn, err := nv.GetFQDN(ns.headscale.cfg.BaseDomain)
+	if err != nil {
+		acmeSetDNSRequests.WithLabelValues("rejected").Inc()
+		httpError(writer, NewHTTPError(http.StatusInternalServerError, "could not determine node FQDN", err))
+
+		return
+	}
+
+	wantName := hsdns.ACMEChallengePrefix + strings.TrimSuffix(fqdn, ".")
+	if !strings.EqualFold(strings.TrimSuffix(dnsReq.Name, "."), wantName) {
+		acmeSetDNSRequests.WithLabelValues("rejected").Inc()
+		log.Warn().Caller().
+			Uint64("node.id", nv.ID().Uint64()).
+			Str("node.name", nv.GivenName()).
+			Str("requested_name", dnsReq.Name).
+			Msg("node requested an ACME challenge record for a name that is not its own")
+		httpError(writer, NewHTTPError(http.StatusForbidden, "node is not allowed to set this DNS record", nil))
+
+		return
+	}
+
+	if !hsdns.ValidACMEChallengeValue(dnsReq.Value) {
+		acmeSetDNSRequests.WithLabelValues("rejected").Inc()
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "invalid TXT record value", hsdns.ErrInvalidACMEChallengeValue))
+
+		return
+	}
+
+	err = ns.headscale.acmeDNS.SetTXT(wantName, dnsReq.Value)
+	if err != nil {
+		acmeSetDNSRequests.WithLabelValues("rejected").Inc()
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "invalid TXT record value", err))
+
+		return
+	}
+
+	acmeSetDNSRequests.WithLabelValues("ok").Inc()
+	log.Info().
+		Uint64("node.id", nv.ID().Uint64()).
+		Str("node.name", nv.GivenName()).
+		Str("name", wantName).
+		Msg("published ACME DNS-01 challenge record")
+
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(writer).Encode(tailcfg.SetDNSResponse{})
+	if err != nil {
+		log.Error().Caller().Err(err).Msg("noise set-dns handler: failed to encode SetDNSResponse")
+	}
 }
