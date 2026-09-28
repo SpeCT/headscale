@@ -143,9 +143,19 @@ func loadGrantTestFile(t *testing.T, path string) *testcapture.Capture {
 // Tests are grouped by root cause.
 //
 //	USER_PASSKEY_WILDCARD - 2 tests: user:*@passkey wildcard pattern not supported
+//	SELF_HOSTED_INGRESS - 1 test: tailscale.com/cap/ingress is grantable on purpose
 //
-// Total: 2 tests skipped, ~246 tests expected to pass.
+// Total: 3 tests skipped, ~245 tests expected to pass.
 var grantSkipReasons = map[string]string{
+	// SELF_HOSTED_INGRESS (1 test)
+	//
+	// SaaS rejects "tailscale.com/cap/ingress" in grants because it
+	// operates the Funnel relays and grants the capability itself.
+	// headscale has no relays: the operator runs one as a tailnet node
+	// and designates it with exactly this grant (see
+	// PeerCapabilityIngressGrant), so the policy is accepted on purpose.
+	"grant-k9": "SELF_HOSTED_INGRESS: tailscale.com/cap/ingress is grantable in headscale",
+
 	// USER_PASSKEY_WILDCARD (2 tests)
 	//
 	// Tailscale SaaS policies can use user:*@passkey as a wildcard matching

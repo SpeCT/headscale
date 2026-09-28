@@ -155,6 +155,34 @@ func TestNodeAttrsCompile(t *testing.T) {
 			},
 		},
 		{
+			name:  "funnel attr also emits the allowed-ports capability",
+			extra: `"nodeAttrs": [{"target": ["tag:server"], "attr": ["funnel"]}]`,
+			want: map[types.NodeID]tailcfg.NodeCapMap{
+				3: {
+					tailcfg.NodeAttrFunnel: nil,
+					FunnelPortsCapability:  nil,
+				},
+			},
+		},
+		{
+			name: "funnel on a user target hits only that user's untagged nodes",
+			extra: `"nodeAttrs": [
+				{"target": ["alice@example.com"], "attr": ["funnel"]},
+				{"target": ["*"],                 "attr": ["randomize-client-port"]}
+			]`,
+			want: map[types.NodeID]tailcfg.NodeCapMap{
+				1: {
+					tailcfg.NodeAttrFunnel:              nil,
+					FunnelPortsCapability:               nil,
+					tailcfg.NodeAttrRandomizeClientPort: nil,
+				},
+				2: capMap(tailcfg.NodeAttrRandomizeClientPort),
+				3: capMap(tailcfg.NodeAttrRandomizeClientPort),
+				4: capMap(tailcfg.NodeAttrRandomizeClientPort),
+				5: capMap(tailcfg.NodeAttrRandomizeClientPort),
+			},
+		},
+		{
 			name:  "empty entry compiles to nothing",
 			extra: `"nodeAttrs": [{"target": ["*"]}]`,
 			want:  nil,
@@ -234,11 +262,6 @@ func TestNodeAttrsValidate(t *testing.T) {
 			name:    "autogroup:owner target rejected with user-role hint",
 			extra:   `"nodeAttrs": [{"target": ["autogroup:owner"], "attr": ["randomize-client-port"]}]`,
 			wantErr: ErrNodeAttrsAutogroupNotAllowed,
-		},
-		{
-			name:    "funnel attr rejected as unsupported",
-			extra:   `"nodeAttrs": [{"target": ["*"], "attr": ["funnel"]}]`,
-			wantErr: ErrNodeAttrUnsupported,
 		},
 		{
 			name:    "ipPool set rejected as unsupported",

@@ -40,7 +40,7 @@ provides on overview of Headscale's feature and compatibility with the Tailscale
     - [x] Basic registration
     - [x] Update user profile from identity provider
     - [ ] OIDC groups cannot be used in ACLs
-- [ ] [Funnel](https://tailscale.com/docs/features/tailscale-funnel) ([#1040](https://github.com/juanfont/headscale/issues/1040))
+- [x] [Funnel](https://tailscale.com/docs/features/tailscale-funnel) ([#1040](https://github.com/juanfont/headscale/issues/1040)) with a [self-hosted ingress relay](../ref/serve.md#funnel)
 - [x] [Serve](https://tailscale.com/docs/features/tailscale-serve) ([#1921](https://github.com/juanfont/headscale/issues/1921))
     - [x] HTTP serve (MagicDNS only)
     - [x] [HTTPS serve and per-node TLS certificates](../ref/serve.md) via ACME DNS-01 (requires `dns.https_certs` and a publicly delegated `base_domain`)

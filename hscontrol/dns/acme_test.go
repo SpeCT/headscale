@@ -2,6 +2,7 @@ package dns
 
 import (
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -43,7 +44,17 @@ func query(t *testing.T, s *ACMEChallengeServer, name string, qtype uint16) *dns
 }
 
 func newTestServer() *ACMEChallengeServer {
-	return NewACMEChallengeServer("tailnet.example.com", "ns1.example.com", "127.0.0.1:0")
+	return NewACMEChallengeServer("tailnet.example.com", "ns1.example.com", "127.0.0.1:0", nil)
+}
+
+// newIngressTestServer is newTestServer with Funnel ingress addresses; the
+// nameserver is placed inside the zone to exercise its exclusion.
+func newIngressTestServer() *ACMEChallengeServer {
+	return NewACMEChallengeServer("tailnet.example.com", "ns.tailnet.example.com", "127.0.0.1:0", []netip.Addr{
+		netip.MustParseAddr("203.0.113.10"),
+		netip.MustParseAddr("2001:db8::10"),
+		netip.MustParseAddr("203.0.113.11"),
+	})
 }
 
 func TestValidACMEChallengeValue(t *testing.T) {
@@ -180,6 +191,102 @@ func TestACMEChallengeServerNODATA(t *testing.T) {
 			assert.True(t, ok, "authority record is %T, want *dns.SOA", m.Ns[0])
 		})
 	}
+}
+
+func TestACMEChallengeServerIngressAddrs(t *testing.T) {
+	t.Parallel()
+
+	s := newIngressTestServer()
+	require.NoError(t, s.SetTXT("_acme-challenge.host.tailnet.example.com", "token"))
+
+	tests := []struct {
+		name  string
+		qname string
+		qtype uint16
+		want  []string
+	}{
+		{"a-for-node", "host.tailnet.example.com", dns.TypeA, []string{"203.0.113.10", "203.0.113.11"}},
+		{"aaaa-for-node", "host.tailnet.example.com", dns.TypeAAAA, []string{"2001:db8::10"}},
+		{"a-is-case-insensitive", "HOST.Tailnet.Example.COM", dns.TypeA, []string{"203.0.113.10", "203.0.113.11"}},
+		{"a-for-deeper-name", "deep.host.tailnet.example.com", dns.TypeA, []string{"203.0.113.10", "203.0.113.11"}},
+		{"a-for-challenge-name", "_acme-challenge.host.tailnet.example.com", dns.TypeA, []string{"203.0.113.10", "203.0.113.11"}},
+		// The apex is the zone, not a node, and the in-zone nameserver's
+		// address is glue owned by the parent zone.
+		{"a-for-apex", "tailnet.example.com", dns.TypeA, nil},
+		{"aaaa-for-apex", "tailnet.example.com", dns.TypeAAAA, nil},
+		{"a-for-in-zone-nameserver", "ns.tailnet.example.com", dns.TypeA, nil},
+		// Nothing else changes.
+		{"caa-for-node", "host.tailnet.example.com", dns.TypeCAA, nil},
+		{"txt-unknown-name", "other.tailnet.example.com", dns.TypeTXT, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := query(t, s, tt.qname, tt.qtype)
+
+			assert.Equal(t, dns.RcodeSuccess, m.Rcode)
+			assert.True(t, m.Authoritative)
+
+			var got []string
+
+			for _, rr := range m.Answer {
+				assert.Equal(t, dns.CanonicalName(tt.qname), rr.Header().Name)
+				assert.Equal(t, tt.qtype, rr.Header().Rrtype)
+				assert.EqualValues(t, ingressAnswerTTL, rr.Header().Ttl)
+
+				switch rr := rr.(type) {
+				case *dns.A:
+					got = append(got, rr.A.String())
+				case *dns.AAAA:
+					got = append(got, rr.AAAA.String())
+				default:
+					t.Fatalf("unexpected answer type %T", rr)
+				}
+			}
+
+			assert.Equal(t, tt.want, got)
+
+			if tt.want == nil {
+				require.Len(t, m.Ns, 1, "NODATA must carry the SOA in the authority section")
+				_, ok := m.Ns[0].(*dns.SOA)
+				assert.True(t, ok)
+			} else {
+				assert.Empty(t, m.Ns)
+			}
+		})
+	}
+
+	// The challenge record is still served alongside the addresses.
+	m := query(t, s, "_acme-challenge.host.tailnet.example.com", dns.TypeTXT)
+	require.Len(t, m.Answer, 1)
+	txt, ok := m.Answer[0].(*dns.TXT)
+	require.True(t, ok, "answer is %T, want *dns.TXT", m.Answer[0])
+	assert.Equal(t, []string{"token"}, txt.Txt)
+
+	// Out of zone stays refused.
+	m = query(t, s, "host.example.com", dns.TypeA)
+	assert.Equal(t, dns.RcodeRefused, m.Rcode)
+}
+
+func TestACMEChallengeServerIngressAddrsV4Only(t *testing.T) {
+	t.Parallel()
+
+	s := NewACMEChallengeServer("tailnet.example.com", "ns1.example.com", "127.0.0.1:0", []netip.Addr{
+		netip.MustParseAddr("203.0.113.10"),
+	})
+
+	m := query(t, s, "host.tailnet.example.com", dns.TypeA)
+	require.Len(t, m.Answer, 1)
+	a, ok := m.Answer[0].(*dns.A)
+	require.True(t, ok, "answer is %T, want *dns.A", m.Answer[0])
+	assert.Equal(t, "203.0.113.10", a.A.String())
+
+	m = query(t, s, "host.tailnet.example.com", dns.TypeAAAA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode, "AAAA without an IPv6 ingress address is NODATA, not an error")
+	assert.Empty(t, m.Answer)
+	require.Len(t, m.Ns, 1)
 }
 
 func TestACMEChallengeServerSOAandNS(t *testing.T) {
@@ -364,7 +471,7 @@ func TestACMEChallengeServerStartBindError(t *testing.T) {
 
 	// Reusing the bound UDP port must surface a bind error rather than a
 	// silently dead listener.
-	second := NewACMEChallengeServer("tailnet.example.com", "ns1.example.com", first.UDPAddr().String())
+	second := NewACMEChallengeServer("tailnet.example.com", "ns1.example.com", first.UDPAddr().String(), nil)
 	err := second.Start()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "binding")

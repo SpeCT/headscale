@@ -1,6 +1,7 @@
 package types
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -77,6 +78,42 @@ func TestResolveHTTPSCerts(t *testing.T) {
 			wantNameserver: "ns.ts.example.com",
 			wantListenAddr: ":53",
 		},
+		{
+			name: "ingress addresses are accepted",
+			dns: DNSConfig{MagicDNS: true, BaseDomain: "ts.example.com", HTTPSCerts: HTTPSCertsConfig{
+				Enabled:      true,
+				IngressAddrs: []netip.Addr{netip.MustParseAddr("203.0.113.10"), netip.MustParseAddr("2001:db8::10")},
+			}},
+			serverURL:      "https://headscale.example.com",
+			wantNameserver: "headscale.example.com",
+			wantListenAddr: ":53",
+		},
+		{
+			name: "unspecified ingress address rejected",
+			dns: DNSConfig{MagicDNS: true, BaseDomain: "ts.example.com", HTTPSCerts: HTTPSCertsConfig{
+				Enabled:      true,
+				IngressAddrs: []netip.Addr{netip.MustParseAddr("0.0.0.0")},
+			}},
+			serverURL: "https://headscale.example.com",
+			wantErr:   errHTTPSCertsInvalidIngressAddr,
+		},
+		{
+			name: "loopback ingress address rejected",
+			dns: DNSConfig{MagicDNS: true, BaseDomain: "ts.example.com", HTTPSCerts: HTTPSCertsConfig{
+				Enabled:      true,
+				IngressAddrs: []netip.Addr{netip.MustParseAddr("::1")},
+			}},
+			serverURL: "https://headscale.example.com",
+			wantErr:   errHTTPSCertsInvalidIngressAddr,
+		},
+		{
+			name: "ingress addresses are ignored while disabled",
+			dns: DNSConfig{MagicDNS: true, BaseDomain: "ts.example.com", HTTPSCerts: HTTPSCertsConfig{
+				Enabled:      false,
+				IngressAddrs: []netip.Addr{netip.MustParseAddr("0.0.0.0")},
+			}},
+			serverURL: "https://headscale.example.com",
+		},
 	}
 
 	for _, tt := range tests {
@@ -124,6 +161,9 @@ dns:
     enabled: true
     listen_addr: ":5353"
     nameserver: ns1.example.com
+    ingress_addrs:
+      - 203.0.113.10
+      - "2001:db8::10"
 `)
 	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "config.yaml"), configYAML, 0o600))
 
@@ -136,11 +176,37 @@ dns:
 	assert.True(t, dnsCfg.HTTPSCerts.Enabled)
 	assert.Equal(t, ":5353", dnsCfg.HTTPSCerts.ListenAddr)
 	assert.Equal(t, "ns1.example.com", dnsCfg.HTTPSCerts.Nameserver)
+	assert.Equal(t, []netip.Addr{netip.MustParseAddr("203.0.113.10"), netip.MustParseAddr("2001:db8::10")}, dnsCfg.HTTPSCerts.IngressAddrs)
 
 	cfg, err := LoadServerConfig()
 	require.NoError(t, err)
 	assert.True(t, cfg.DNSConfig.HTTPSCerts.Enabled)
 	assert.Equal(t, "ns1.example.com", cfg.DNSConfig.HTTPSCerts.Nameserver)
+	assert.Len(t, cfg.DNSConfig.HTTPSCerts.IngressAddrs, 2)
+
+	// A malformed address is a load error, not a silent skip.
+	viper.Reset()
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(`
+server_url: https://headscale.example.com
+listen_addr: 0.0.0.0:8080
+noise:
+  private_key_path: `+filepath.Join(tmpDir, "noise.key")+`
+database:
+  type: sqlite3
+prefixes:
+  v4: 100.64.0.0/10
+dns:
+  magic_dns: true
+  base_domain: ts.example.com
+  override_local_dns: false
+  https_certs:
+    enabled: true
+    ingress_addrs: ["not-an-ip"]
+`), 0o600))
+	require.NoError(t, LoadConfig(tmpDir, false))
+
+	_, err = dns()
+	require.ErrorIs(t, err, errHTTPSCertsInvalidIngressAddr)
 
 	// Defaults when the section is missing.
 	viper.Reset()
@@ -166,6 +232,7 @@ dns:
 	assert.False(t, dnsCfg.HTTPSCerts.Enabled)
 	assert.Empty(t, dnsCfg.HTTPSCerts.ListenAddr, "defaults apply only once the feature is enabled")
 	assert.Empty(t, dnsCfg.HTTPSCerts.Nameserver)
+	assert.Empty(t, dnsCfg.HTTPSCerts.IngressAddrs)
 
 	cfg, err = LoadServerConfig()
 	require.NoError(t, err)

@@ -8,7 +8,7 @@ configuration lives on the client, not on Headscale.
 | ---------------------------------------------------- | ------------------------------------------- | ----------------------------------------------- |
 | `tailscale serve --http=...` (plain HTTP)            | MagicDNS                                    | Works out of the box                            |
 | `tailscale serve` (HTTPS, the default) and `tailscale cert` | Per-node TLS certificates            | Requires the setup on this page                 |
-| `tailscale funnel` (public internet)                 | Tailscale's ingress relays                  | **Not supported**, see [below](#funnel-is-not-supported) |
+| `tailscale funnel` (public internet)                 | Per-node TLS certificates, public DNS, a self-hosted ingress relay | Requires the setup on this page, see [Funnel](#funnel) |
 
 Plain HTTP serve only relies on [MagicDNS](dns.md). Serving over **HTTPS** needs a browser-trusted TLS certificate for
 the node's MagicDNS name (`<node>.<base_domain>`), which the client obtains itself from
@@ -131,8 +131,77 @@ allowed to reach the serving node by the [policy](policy.md) can connect; a cert
 - The metric `headscale_acme_set_dns_requests_total{status}` counts accepted (`ok`) and rejected challenge
   publications and requests made while the feature is `disabled`.
 
-## Funnel is not supported
+## Funnel
 
-[Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel) exposes a node's service to the public
-internet through Tailscale-operated ingress relays. Headscale cannot provide that infrastructure, so Funnel is not
-supported. See [#1040](https://github.com/juanfont/headscale/issues/1040).
+[Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel) exposes a node's HTTPS service to the public
+internet. With Tailscale's control plane, `*.ts.net` resolves publicly to Tailscale-operated ingress relays; a relay
+reads the server name from the TLS handshake, hands the connection to the node over the tailnet and the node
+terminates TLS with its own certificate. Headscale supports the same client flow; you provide the relay.
+
+### How it works
+
+1. The policy grants the node the `funnel` attribute. Headscale sends `funnel` together with the allowed-ports
+   capability (`443`, `8443` and `10000`, as with Tailscale) in the node's capability map; the `https` capability
+   comes from `https_certs`. The stock CLI checks all three before it accepts `tailscale funnel`.
+2. The embedded DNS server answers `A`/`AAAA` for every name below `base_domain` with the relay's public
+   addresses (`ingress_addrs`). Node tailnet addresses are still never published.
+3. The relay is an ordinary tailnet node that owns a public TCP port. For each public connection it peeks the TLS
+   server name, and if it is a node of the tailnet, opens that node's peer API over the tailnet and sends
+   `POST /v0/ingress` with the `Tailscale-Ingress-Src` and `Tailscale-Ingress-Target` headers. The node accepts only
+   from a peer holding the peer capability `https://tailscale.com/cap/ingress`, and only for targets it has Funnel
+   enabled for; otherwise it rejects the connection. On success the relay splices bytes and the node terminates TLS.
+
+Headscale does not include the relay itself. Any program implementing step 3 works; a reference implementation built
+on `tailscale.com/tsnet` is maintained outside this repository.
+
+### Configuration
+
+```yaml title="config.yaml"
+dns:
+  https_certs:
+    enabled: true
+    # Public addresses of the ingress relay
+    ingress_addrs:
+      - 203.0.113.20
+      - "2001:db8::20"
+```
+
+```json title="policy"
+{
+  "tagOwners": { "tag:ingress": ["alice@example.com"] },
+  "nodeAttrs": [
+    // Nodes allowed to run `tailscale funnel`
+    { "target": ["alice@example.com"], "attr": ["funnel"] }
+  ],
+  "grants": [
+    // The relay may hand public connections to these nodes. Spelled without
+    // the scheme like every app capability; nodes receive it as
+    // https://tailscale.com/cap/ingress, the peer capability tailscaled checks.
+    {
+      "src": ["tag:ingress"],
+      "dst": ["autogroup:member"],
+      "ip": ["*"],
+      "app": { "tailscale.com/cap/ingress": [{}] }
+    }
+  ]
+}
+```
+
+Register the relay as a tagged node (`tag:ingress`), point `ingress_addrs` at its public address, then on a node:
+
+```console
+$ tailscale funnel --bg 8080
+Available on the internet:
+
+https://node.ts.example.com/
+|-- proxy http://127.0.0.1:8080
+
+$ tailscale funnel status
+$ tailscale funnel --https=443 off
+```
+
+The public ports are whatever the relay listens on; with Tailscale these are 443, 8443 and 10000, which is also what
+the ports capability advertises. Anyone on the internet who can guess or read the node name (it is in public
+Certificate Transparency logs) can reach the funnelled service; the relay learns only the server name and the client
+address, never the plaintext, because TLS is terminated on the node. Nodes without the `funnel` attribute and names
+that do not belong to a node are refused by the relay.

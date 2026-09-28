@@ -45,6 +45,7 @@ var (
 	errHTTPSCertsRequiresBaseDomain = errors.New("dns.https_certs.enabled requires dns.base_domain to be set")
 	errHTTPSCertsInvalidListenAddr  = errors.New("dns.https_certs.listen_addr must be a host:port address")
 	errHTTPSCertsNoNameserver       = errors.New("dns.https_certs.nameserver must be set when server_url has no hostname")
+	errHTTPSCertsInvalidIngressAddr = errors.New("dns.https_certs.ingress_addrs must contain public unicast IP addresses")
 	ErrNoPrefixConfigured           = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
 	ErrInvalidAllocationStrategy    = errors.New("invalid prefix allocation strategy")
 )
@@ -187,6 +188,13 @@ type HTTPSCertsConfig struct {
 	// server_url. Prefer a name outside base_domain, otherwise the parent
 	// zone must also carry glue A/AAAA records for it.
 	Nameserver string `mapstructure:"nameserver"`
+
+	// IngressAddrs are the public IPv4/IPv6 addresses of a Funnel ingress
+	// relay. When set, the embedded DNS server answers A/AAAA for every
+	// name below base_domain with them, so `tailscale funnel` services
+	// are reachable from the public internet at <node>.<base_domain>.
+	// Empty (the default) keeps node names unresolvable outside the tailnet.
+	IngressAddrs []netip.Addr `mapstructure:"ingress_addrs"`
 }
 
 type Nameservers struct {
@@ -951,6 +959,15 @@ func dns() (DNSConfig, error) {
 	dns.HTTPSCerts.ListenAddr = viper.GetString("dns.https_certs.listen_addr")
 	dns.HTTPSCerts.Nameserver = viper.GetString("dns.https_certs.nameserver")
 
+	for _, raw := range viper.GetStringSlice("dns.https_certs.ingress_addrs") {
+		addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil {
+			return DNSConfig{}, fmt.Errorf("%w: %w", errHTTPSCertsInvalidIngressAddr, err)
+		}
+
+		dns.HTTPSCerts.IngressAddrs = append(dns.HTTPSCerts.IngressAddrs, addr)
+	}
+
 	if viper.IsSet("dns.extra_records") {
 		var extraRecords []tailcfg.DNSRecord
 
@@ -1003,6 +1020,12 @@ func (d *DNSConfig) resolveHTTPSCerts(serverURL string) error {
 		}
 
 		c.Nameserver = u.Hostname()
+	}
+
+	for _, addr := range c.IngressAddrs {
+		if !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLoopback() {
+			return fmt.Errorf("%w: %q", errHTTPSCertsInvalidIngressAddr, addr)
+		}
 	}
 
 	c.Nameserver = strings.TrimSuffix(strings.ToLower(c.Nameserver), ".")

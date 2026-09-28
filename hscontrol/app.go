@@ -695,6 +695,7 @@ func (h *Headscale) Serve() error {
 			h.cfg.BaseDomain,
 			h.cfg.DNSConfig.HTTPSCerts.Nameserver,
 			h.cfg.DNSConfig.HTTPSCerts.ListenAddr,
+			h.cfg.DNSConfig.HTTPSCerts.IngressAddrs,
 		)
 
 		err = h.acmeDNS.Start()
@@ -703,10 +704,16 @@ func (h *Headscale) Serve() error {
 		}
 		defer h.acmeDNS.Close()
 
+		ingressAddrs := make([]string, 0, len(h.cfg.DNSConfig.HTTPSCerts.IngressAddrs))
+		for _, addr := range h.cfg.DNSConfig.HTTPSCerts.IngressAddrs {
+			ingressAddrs = append(ingressAddrs, addr.String())
+		}
+
 		log.Info().
 			Str("listen_addr", h.cfg.DNSConfig.HTTPSCerts.ListenAddr).
 			Str("zone", h.cfg.BaseDomain).
 			Str("nameserver", h.cfg.DNSConfig.HTTPSCerts.Nameserver).
+			Strs("ingress_addrs", ingressAddrs).
 			Msg("authoritative DNS server for per-node HTTPS certificates started")
 	}
 

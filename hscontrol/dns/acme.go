@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -37,6 +38,12 @@ const (
 
 	// acmeZoneTTL is the DNS TTL (seconds) of the apex SOA and NS answers.
 	acmeZoneTTL = 300
+
+	// ingressAnswerTTL is the DNS TTL (seconds) of the A/AAAA answers that
+	// point node names at the Funnel ingress relay. Long enough to be
+	// cache friendly, short enough that moving the relay propagates within
+	// minutes.
+	ingressAnswerTTL = 300
 
 	// acmeCleanupInterval is how often expired values are evicted.
 	acmeCleanupInterval = time.Minute
@@ -91,12 +98,21 @@ func ValidACMEChallengeValue(value string) bool {
 // challenge TXT records are served. Node A/AAAA records are deliberately not
 // served here: address resolution stays inside the tailnet via MagicDNS.
 //
+// The exception is Funnel: when ingressAddrs is set, every name below the
+// apex resolves to those public addresses, as *.ts.net resolves to
+// Tailscale's ingress relays. The relay dispatches on the TLS SNI, so the
+// node's tailnet address still never appears in public DNS.
+//
 // For the challenges to validate, the base domain must be a real, publicly
 // delegated zone whose NS record points at this server.
 type ACMEChallengeServer struct {
 	zone       string // base domain, canonical (lowercase, trailing dot)
 	nameserver string // authoritative NS FQDN, canonical
 	listenAddr string
+
+	// ingressAddrs are the public addresses answered for A/AAAA queries of
+	// any name below the apex. Empty means NODATA, as before Funnel.
+	ingressAddrs []netip.Addr
 
 	// now is the clock used for record expiry; tests override it.
 	now func() time.Time
@@ -122,19 +138,21 @@ type txtRecord struct {
 // NewACMEChallengeServer creates a DNS server authoritative for zone (the
 // MagicDNS base domain). nameserver is the FQDN reported in SOA and NS
 // answers. listenAddr is the UDP/TCP address to bind; when empty it defaults
-// to ":53".
-func NewACMEChallengeServer(zone, nameserver, listenAddr string) *ACMEChallengeServer {
+// to ":53". ingressAddrs, if any, are the public addresses of the Funnel
+// ingress relay answered for A/AAAA queries of every name below the apex.
+func NewACMEChallengeServer(zone, nameserver, listenAddr string, ingressAddrs []netip.Addr) *ACMEChallengeServer {
 	if listenAddr == "" {
 		listenAddr = ":53"
 	}
 
 	return &ACMEChallengeServer{
-		zone:       dns.CanonicalName(zone),
-		nameserver: dns.CanonicalName(nameserver),
-		listenAddr: listenAddr,
-		now:        time.Now,
-		records:    make(map[string][]txtRecord),
-		closeCh:    make(chan struct{}),
+		zone:         dns.CanonicalName(zone),
+		nameserver:   dns.CanonicalName(nameserver),
+		listenAddr:   listenAddr,
+		ingressAddrs: ingressAddrs,
+		now:          time.Now,
+		records:      make(map[string][]txtRecord),
+		closeCh:      make(chan struct{}),
 	}
 }
 
@@ -362,10 +380,11 @@ func (s *ACMEChallengeServer) evictExpired() {
 }
 
 // serveDNS answers queries for the delegated zone. It is authoritative: it
-// serves the apex SOA/NS and the published challenge TXT records, and
-// returns NODATA (NOERROR with the SOA in the authority section) for any
-// other in-zone name or type, including A/AAAA and the CAA lookups a CA
-// performs before issuance. Queries outside the zone are refused.
+// serves the apex SOA/NS, the published challenge TXT records and, when
+// ingress addresses are configured, A/AAAA for every name below the apex.
+// It returns NODATA (NOERROR with the SOA in the authority section) for any
+// other in-zone name or type, including the CAA lookups a CA performs before
+// issuance. Queries outside the zone are refused.
 func (s *ACMEChallengeServer) serveDNS(w dns.ResponseWriter, r *dns.Msg) {
 	m := new(dns.Msg)
 	m.SetReply(r)
@@ -418,6 +437,8 @@ func (s *ACMEChallengeServer) serveDNS(w dns.ResponseWriter, r *dns.Msg) {
 				Txt: []string{v},
 			})
 		}
+	case q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA:
+		m.Answer = append(m.Answer, s.ingress(qname, q.Qtype)...)
 	}
 
 	if len(m.Answer) == 0 {
@@ -445,6 +466,37 @@ func (s *ACMEChallengeServer) respond(w dns.ResponseWriter, r, m *dns.Msg) {
 	if err != nil {
 		log.Debug().Caller().Err(err).Msg("writing ACME challenge DNS response")
 	}
+}
+
+// ingress returns the A or AAAA records pointing qname at the Funnel
+// ingress relay. It behaves like a wildcard: every name below the apex
+// resolves, whatever its depth. The apex itself is excluded (it is the
+// zone, not a node) and so is the nameserver when it lives inside the zone:
+// its address is the parent zone's glue for this server, not the relay.
+func (s *ACMEChallengeServer) ingress(qname string, qtype uint16) []dns.RR {
+	if len(s.ingressAddrs) == 0 || qname == s.zone || qname == s.nameserver {
+		return nil
+	}
+
+	var rrs []dns.RR
+
+	for _, addr := range s.ingressAddrs {
+		hdr := dns.RR_Header{
+			Name:   qname,
+			Rrtype: qtype,
+			Class:  dns.ClassINET,
+			Ttl:    ingressAnswerTTL,
+		}
+
+		switch {
+		case qtype == dns.TypeA && addr.Is4():
+			rrs = append(rrs, &dns.A{Hdr: hdr, A: addr.AsSlice()})
+		case qtype == dns.TypeAAAA && addr.Is6():
+			rrs = append(rrs, &dns.AAAA{Hdr: hdr, AAAA: addr.AsSlice()})
+		}
+	}
+
+	return rrs
 }
 
 func (s *ACMEChallengeServer) soa() *dns.SOA {

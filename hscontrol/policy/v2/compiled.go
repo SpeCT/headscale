@@ -135,6 +135,16 @@ func buildUserNodeIndex(
 	return idx
 }
 
+// FunnelPortsCapability is the companion capability the hosted control
+// plane emits next to [tailcfg.NodeAttrFunnel]. The client reads the
+// `ports` query parameter (ipn.CheckFunnelPort) and only lets
+// `tailscale funnel` listen on one of them; 443, 8443 and 10000 are the
+// only ports Tailscale has ever allowed for Funnel. Without it the CLI
+// refuses every port.
+const FunnelPortsCapability = tailcfg.NodeCapability(
+	string(tailcfg.CapabilityFunnelPorts) + "?ports=443,8443,10000",
+)
+
 // compileNodeAttrs returns the per-node CapMap derived from policy
 // nodeAttrs plus the tailnet-wide [Policy.RandomizeClientPort] flag.
 //
@@ -214,6 +224,15 @@ func (pol *Policy) compileNodeAttrs(
 
 			for _, attr := range na.Attrs {
 				stamp(ni.id, attr)
+
+				// Granting funnel implies the allowed-ports cap, as
+				// on the hosted control plane. Funnel itself still
+				// needs the https cap (dns.https_certs) and an
+				// ingress relay holding the peer capability
+				// https://tailscale.com/cap/ingress toward the node.
+				if attr == tailcfg.NodeAttrFunnel {
+					stamp(ni.id, FunnelPortsCapability)
+				}
 			}
 		}
 	}
@@ -283,6 +302,11 @@ func (pol *Policy) compileOneGrant(
 			otherDests = append(otherDests, dest)
 		}
 	}
+
+	// Emit aliased capability names (tailscale.com/cap/ingress) in the
+	// form the client checks. grant is a copy, so this does not touch
+	// the policy.
+	grant.App = canonicalPeerCapMap(grant.App)
 
 	// Resolve sources per-alias, tracking non-wildcard sources
 	// separately so we can preserve their IPs alongside the

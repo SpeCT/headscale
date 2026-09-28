@@ -397,6 +397,14 @@ dns:
     # answers. Defaults to the hostname of `server_url`. Prefer a name outside
     # `base_domain`; an in-zone name needs glue records in the parent zone.
     nameserver: ""
+    # Tailscale Funnel: public IPv4/IPv6 addresses of a self-hosted ingress
+    # relay. When set, every name below `base_domain` resolves publicly to
+    # these addresses (like *.ts.net resolves to Tailscale's relays) so that
+    # `tailscale funnel` services are reachable at https://<node>.<base_domain>.
+    # Nodes also need the `funnel` attribute in the policy (nodeAttrs) and the
+    # relay needs the `https://tailscale.com/cap/ingress` grant. Leave empty
+    # to keep node names unresolvable from the public internet.
+    ingress_addrs: []
 
 # Unix socket used for the CLI to connect without authentication
 # Note: for production you will want to set this to something like:

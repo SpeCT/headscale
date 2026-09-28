@@ -50,7 +50,7 @@ func newSetDNSTestEnv(t *testing.T) *setDNSTestEnv {
 	app.cfg.DNSConfig.MagicDNS = true
 	app.cfg.DNSConfig.BaseDomain = setDNSTestBaseDomain
 	app.cfg.DNSConfig.HTTPSCerts.Enabled = true
-	app.acmeDNS = hsdns.NewACMEChallengeServer(setDNSTestBaseDomain, "ns1.example.com", "127.0.0.1:0")
+	app.acmeDNS = hsdns.NewACMEChallengeServer(setDNSTestBaseDomain, "ns1.example.com", "127.0.0.1:0", nil)
 
 	user := app.state.CreateUserForTest("set-dns-user")
 	node := putNamedTestNodeInStore(t, app, user, "node-a")

@@ -15,13 +15,29 @@ exchange itself, so Headscale never sees the certificate or any private key.
 Only challenge TXT records and the zone SOA/NS are served publicly; node
 A/AAAA records stay private to MagicDNS.
 
-This requires MagicDNS and a real, publicly delegated `base_domain`. Tailscale
-Funnel remains unsupported because it depends on Tailscale's public ingress
-infrastructure. See the [Serve documentation](./docs/ref/serve.md) for setup.
+This requires MagicDNS and a real, publicly delegated `base_domain`. See the
+[Serve documentation](./docs/ref/serve.md) for setup.
 
 [#1921](https://github.com/juanfont/headscale/issues/1921)
 [#2527](https://github.com/juanfont/headscale/issues/2527)
 [#3300](https://github.com/juanfont/headscale/pull/3300)
+
+### Tailscale Funnel with a self-hosted ingress relay
+
+The `funnel` node attribute is now accepted in `nodeAttrs`. Nodes granted it
+receive `funnel` together with the allowed-ports capability
+(`443`, `8443`, `10000`), exactly as Tailscale's control plane sends them, so a
+stock client accepts `tailscale funnel`. The new `dns.https_certs.ingress_addrs`
+option makes the embedded DNS server answer `A`/`AAAA` for every name below
+`base_domain` with the public addresses of an ingress relay. The relay is an
+ordinary tailnet node that hands public TLS connections to the node's peer
+API; it is not part of Headscale. Grants may now carry the app capability
+`tailscale.com/cap/ingress`, delivered to nodes as
+`https://tailscale.com/cap/ingress`, which is what tailscaled requires from
+the relay. See the [Serve documentation](./docs/ref/serve.md#funnel).
+
+[#1040](https://github.com/juanfont/headscale/issues/1040)
+[#2527](https://github.com/juanfont/headscale/issues/2527)
 
 ## 0.29.4 (2026-09-23)
 

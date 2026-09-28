@@ -324,6 +324,7 @@ jobs:
           - TestHeadscale
           - TestTailscaleNodesJoiningHeadcale
           - TestServeHTTPSCertDomains
+          - TestFunnelNodeAttr
           - TestSSHOneUserToAll
           - TestSSHMultipleUsersAllToAll
           - TestSSHNoSSHConfigured
